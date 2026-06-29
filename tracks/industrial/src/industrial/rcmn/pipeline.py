@@ -83,7 +83,10 @@ class RCMNPipeline:
 
         # --- State (populated by train()) ---
         self.memory_banks: dict[tuple[float, int], torch.Tensor] = {}
-        self.normal_stats: dict = {}
+        # Initialize with placeholder threshold=0 so predict() works during
+        # training's threshold calibration phase (before real threshold is set).
+        # This mirrors SuperADD's self.threshold = 0 in __init__.
+        self.normal_stats: dict = {'threshold': 0.0}
         # Reliability metadata (used by RSF fusion strategy)
         self.normal_dists: dict[tuple[float, int], tuple[float, float]] = {}
         self.feat_means: dict[tuple[float, int], torch.Tensor] = {}
