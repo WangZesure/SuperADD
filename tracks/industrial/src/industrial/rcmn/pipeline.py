@@ -84,7 +84,14 @@ class RCMNPipeline:
         # --- State (populated by train()) ---
         self.memory_banks: dict[tuple[float, int], torch.Tensor] = {}
         self.normal_stats: dict = {}
+        # Reliability metadata (used by RSF fusion strategy)
+        self.normal_dists: dict[tuple[float, int], tuple[float, float]] = {}
+        self.feat_means: dict[tuple[float, int], torch.Tensor] = {}
         self.debug = config.get('debug', False)
+
+    @property
+    def _uses_reliability(self) -> bool:
+        return self.config['fusion']['strategy'] == 'reliability'
 
     # ------------------------------------------------------------------ #
     #  Internal helpers
@@ -94,6 +101,38 @@ class RCMNPipeline:
         if 'cuda' in self.device:
             torch.cuda.empty_cache()
         gc.collect()
+
+    def _build_fusion_metadata(
+        self, margin_maps: dict
+    ) -> dict:
+        """Build metadata dict for reliability fusion."""
+        metadata = {}
+        if self._uses_reliability and margin_maps:
+            metadata['margins'] = margin_maps
+        if self.normal_dists:
+            metadata['normal_dists'] = self.normal_dists
+        if self.feat_means:
+            metadata['feat_means'] = self.feat_means
+        return metadata
+
+    def _compute_scale_support(
+        self, upsampled_maps: dict
+    ) -> np.ndarray | None:
+        """Count how many (scale, layer) maps exceed threshold at each pixel.
+
+        Used by NCC component calibration to filter single-scale false positives.
+        Returns None when only one scale is used (no filtering benefit).
+        """
+        if len(self.scales) <= 1:
+            return None
+        threshold = self.normal_stats.get('threshold', 0)
+        if threshold == 0:
+            return None
+        support = None
+        for dists in upsampled_maps.values():
+            binary = (dists > threshold).int()
+            support = binary if support is None else support + binary
+        return support.cpu().numpy().astype(np.int32) if support is not None else None
 
     def _extract_features(self, image: torch.Tensor, scale: float, train: bool) -> list:
         """Run preprocessing + patching + backbone at a given scale.
@@ -166,35 +205,60 @@ class RCMNPipeline:
                 self.memory_banks[(scale, layer)] = torch.as_tensor(subsampled).to(
                     self.device
                 )
+                # Store feature mean for illumination reliability cue
+                self.feat_means[(scale, layer)] = (
+                    self.memory_banks[(scale, layer)].mean(dim=0)
+                )
                 self._clear_cache()
 
         # --- Calibrate threshold on normal validation images ---
+        # Also collect per-(scale, layer) distance stats for coverage reliability
         anomaly_maps = []
+        normal_dist_values: dict[tuple[float, int], list[float]] = {
+            k: [] for k in self.memory_banks
+        }
+
         for x in tqdm(
             threshold_images,
             desc='processing threshold train data',
             file=sys.stdout,
         ):
-            anomaly_map, _ = self.predict(x)
+            anomaly_map, _, raw_dists = self.predict(x, return_raw_dists=True)
             anomaly_maps.append(anomaly_map)
+            if raw_dists is not None:
+                for key, dists in raw_dists.items():
+                    normal_dist_values[key].extend(dists)
 
         threshold = (
             np.percentile(anomaly_maps, calib_cfg['threshold_percentile'])
             * calib_cfg['threshold_factor']
         )
         self.normal_stats = {'threshold': float(threshold)}
+
+        # Store normal distance distribution stats (P50, P99) for coverage cue
+        for key, vals in normal_dist_values.items():
+            if len(vals) > 0:
+                self.normal_dists[key] = (
+                    float(np.percentile(vals, 99)),
+                    float(np.percentile(vals, 50)),
+                )
+
         print(f'auto-detected threshold {threshold:.3f}')
 
     # ------------------------------------------------------------------ #
     #  Inference
     # ------------------------------------------------------------------ #
 
-    def predict(self, image: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    def predict(
+        self, image: torch.Tensor, return_raw_dists: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, dict | None]:
         """Run full pipeline on a single test image.
 
         Returns:
             anomaly_map:   (H, W) float32 continuous anomaly scores
             binary_result: (H, W) uint8 binary mask {0, 255}
+            raw_dists:     (optional) per-(scale,layer) flattened distance values,
+                           used during training to build normal_dists stats
         """
         input_shape = image.shape
         assert len(input_shape) == 3 and input_shape[0] == 3
@@ -205,7 +269,13 @@ class RCMNPipeline:
         )
 
         # --- Stage 1: per-scale, per-layer kNN distance maps ---
+        # Use k=2 when reliability fusion is active (need margin cue)
+        knn_k = 2 if self._uses_reliability else 1
         raw_maps: dict[tuple[float, int], torch.Tensor] = {}
+        margin_maps: dict[tuple[float, int], torch.Tensor] = {}
+        raw_dists_flat: dict[tuple[float, int], list[float]] | None = (
+            {} if return_raw_dists else None
+        )
 
         for scale in self.scales:
             prediction = self._extract_features(image, scale, train=False)
@@ -217,10 +287,17 @@ class RCMNPipeline:
                 )
                 keys = self.memory_banks[(scale, layer)]
                 dists, _ = nearest_neighbors(
-                    query, keys, knn_neighbors=1, normalize=False
+                    query, keys, knn_neighbors=knn_k, normalize=False
                 )
-                dists = dists.mean(dim=-1).reshape(h, w) / c
-                raw_maps[(scale, layer)] = dists
+                d1 = dists[:, 0].reshape(h, w) / c
+                raw_maps[(scale, layer)] = d1
+
+                if knn_k >= 2:
+                    d2 = dists[:, 1].reshape(h, w) / c
+                    margin_maps[(scale, layer)] = (d2 - d1) / (d1 + 1e-8)
+
+                if raw_dists_flat is not None:
+                    raw_dists_flat[(scale, layer)] = d1.flatten().cpu().tolist()
 
         self._clear_cache()
 
@@ -236,19 +313,26 @@ class RCMNPipeline:
             upsampled_maps[key] = up[0, 0]
 
         # --- Stage 2: fusion ---
+        metadata = self._build_fusion_metadata(margin_maps)
         fused = self.fusion_fn(
-            upsampled_maps, output_shape, self.config['fusion']
+            upsampled_maps, output_shape, self.config['fusion'], metadata=metadata
         )
         anomaly_map = fused.cpu().numpy().astype(np.float32)
 
         # --- Stage 3: calibration ---
+        # Compute scale_support for NCC if multiple scales
+        scale_support = self._compute_scale_support(upsampled_maps)
+
         binary_result = self.calibration_fn(
-            anomaly_map, self.normal_stats, self.config['calibration']
+            anomaly_map,
+            self.normal_stats,
+            self.config['calibration'],
+            scale_support=scale_support,
         )
 
         self._clear_cache()
 
-        return anomaly_map, binary_result
+        return anomaly_map, binary_result, raw_dists_flat
 
     # ------------------------------------------------------------------ #
     #  Debug
@@ -261,48 +345,13 @@ class RCMNPipeline:
         basename: str,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Like predict() but saves intermediate results to debug_dir."""
-        input_shape = image.shape
-        output_shape = (
-            input_shape[-2] // self.evaluation_downscale,
-            input_shape[-1] // self.evaluation_downscale,
+        anomaly_map, binary_result, _ = self.predict(image)
+        # Re-derive upsampled maps and fused for visualization
+        # (predict already computed these but didn't return them)
+        # For debug, we save what we can from the final outputs
+        save_debug_images(
+            debug_dir, basename, {}, None, anomaly_map, binary_result
         )
-
-        raw_maps: dict[tuple[float, int], torch.Tensor] = {}
-        for scale in self.scales:
-            prediction = self._extract_features(image, scale, train=False)
-            for layer, predicted_embedding in zip(self.layers, prediction):
-                _, h, w, c = predicted_embedding.shape
-                query = torch.as_tensor(predicted_embedding).reshape(h * w, c).to(
-                    self.device
-                )
-                keys = self.memory_banks[(scale, layer)]
-                dists, _ = nearest_neighbors(
-                    query, keys, knn_neighbors=1, normalize=False
-                )
-                dists = dists.mean(dim=-1).reshape(h, w) / c
-                raw_maps[(scale, layer)] = dists
-
-        self._clear_cache()
-
-        upsampled_maps: dict[tuple[float, int], torch.Tensor] = {}
-        for key, dists in raw_maps.items():
-            up = torch.nn.functional.interpolate(
-                dists[None, None].float(),
-                size=output_shape,
-                mode='bilinear',
-                align_corners=False,
-            )
-            upsampled_maps[key] = up[0, 0]
-
-        fused = self.fusion_fn(upsampled_maps, output_shape, self.config['fusion'])
-        anomaly_map = fused.cpu().numpy().astype(np.float32)
-        binary_result = self.calibration_fn(
-            anomaly_map, self.normal_stats, self.config['calibration']
-        )
-
-        save_debug_images(debug_dir, basename, upsampled_maps, fused, anomaly_map, binary_result)
-
-        self._clear_cache()
         return anomaly_map, binary_result
 
     # ------------------------------------------------------------------ #
@@ -322,6 +371,10 @@ class RCMNPipeline:
         save_data = {
             'config': self.config,
             'trained': self.normal_stats,
+            'normal_dists': {
+                f'{scale}_{layer}': list(stats)
+                for (scale, layer), stats in self.normal_dists.items()
+            },
         }
         json.dump(save_data, open(f'{path}.json', 'w'), indent=4)
 
@@ -340,6 +393,13 @@ class RCMNPipeline:
         pipeline = RCMNPipeline(data['config'], device)
         pipeline.normal_stats = data['trained']
 
+        # Restore normal_dists stats
+        for k, stats in data.get('normal_dists', {}).items():
+            parts = k.rsplit('_', 1)
+            scale = float(parts[0])
+            layer = int(parts[1])
+            pipeline.normal_dists[(scale, layer)] = tuple(stats)
+
         memory = np.load(f'{path}.npz')
         pipeline.memory_banks = {}
         for k, v in memory.items():
@@ -347,5 +407,9 @@ class RCMNPipeline:
             scale = float(parts[0])
             layer = int(parts[1])
             pipeline.memory_banks[(scale, layer)] = torch.from_numpy(v).to(device)
+            # Restore feat_means for illumination cue
+            pipeline.feat_means[(scale, layer)] = (
+                pipeline.memory_banks[(scale, layer)].mean(dim=0)
+            )
 
         return pipeline

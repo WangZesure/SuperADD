@@ -20,8 +20,9 @@ To add a new strategy:
     3. Register it here in MEMORY_STRATEGIES
 """
 
-from . import knn_dedup
+from . import knn_dedup, coverage_aware
 
 MEMORY_STRATEGIES = {
     "knn_dedup": knn_dedup.subsample,
+    "coverage_aware": coverage_aware.subsample,
 }

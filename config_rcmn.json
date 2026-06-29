@@ -24,7 +24,9 @@
         "closing_radius": 26,
         "closing_angles": 16,
         "closing_lower_threshold": 0.8,
-        "binary_erosion": 1
+        "binary_erosion": 1,
+        "min_component_area": 5,
+        "min_peak_ratio": 1.0
     },
     "data": {
         "datasets_dir": "./data/",

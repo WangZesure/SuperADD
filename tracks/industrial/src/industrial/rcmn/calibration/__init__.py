@@ -21,8 +21,9 @@ To add a new strategy:
     3. Register it here in CALIBRATION_STRATEGIES
 """
 
-from . import percentile
+from . import percentile, component
 
 CALIBRATION_STRATEGIES = {
     "percentile": percentile.calibrate,
+    "component": component.calibrate,
 }

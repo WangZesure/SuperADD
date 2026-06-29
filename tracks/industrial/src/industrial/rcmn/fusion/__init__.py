@@ -21,8 +21,10 @@ To add a new strategy:
     3. Register it here in FUSION_STRATEGIES
 """
 
-from . import single_scale
+from . import single_scale, mean_multi, reliability
 
 FUSION_STRATEGIES = {
     "single_scale": single_scale.fuse,
+    "mean_multi": mean_multi.fuse,
+    "reliability": reliability.fuse,
 }
