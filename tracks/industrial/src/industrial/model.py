@@ -193,18 +193,20 @@ class SuperADD:
 
         self.__clear_cache()
 
+        # Accumulate embeddings as float16 to halve CPU RAM (avoids OOM on high-res images).
+        # Single backbone pass; convert to float32 only during subsampling.
         prototype_embeddings = defaultdict(list)
         for x in tqdm(train_data_prototypes, 'processing prototype train data', file=sys.stdout):
             x = x.to(self.device)[None]
             x = self.augmented_preprocessing(x)
             prediction = self.patch_exec(x, self.backbone)
             for layer, embedding in zip(self.layers, prediction):
-                prototype_embeddings[layer].append(embedding.reshape(-1, embedding.shape[-1]))
+                prototype_embeddings[layer].append(np.asarray(embedding.reshape(-1, embedding.shape[-1]), dtype=np.float16))
 
         self.prototype_embeddings = {}
         for layer in self.layers:
-            embeddings = prototype_embeddings[layer]
-            embeddings = np.concatenate(embeddings, axis=0).astype(np.float32)
+            embeddings = np.concatenate(prototype_embeddings[layer], axis=0).astype(np.float32)
+            del prototype_embeddings[layer]
             embeddings = subsampling_distance_based_fast(embeddings, self.max_database_size, self.device,
                                                          iterations=100, normalize=False, knn_neighbors=100)
             self.prototype_embeddings[layer] = torch.as_tensor(embeddings).to(self.device)

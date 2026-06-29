@@ -26,20 +26,18 @@ def subsampling_distance_based_fast(features, target_number_of_samples, device, 
     def subsample(x, target_number_of_samples):
         x_torch = torch.from_numpy(x).to(device)
         dists, _ = nearest_neighbors(x_torch, x_torch, knn_neighbors=knn_neighbors, normalize=normalize)
-        dists = dists.cpu().numpy()
-        target_distance_between_samples = np.mean(np.float64(
-            dists)) / 10  # Start with a small distance and increase until we have fewer than the target number of samples
-        number_of_samples = target_number_of_samples + 1  # Initialize to a value greater than target to enter the loop
-        random_numbers = np.random.rand(len(x))
+        # Keep dists on GPU for fast threshold search (avoids CPU bottleneck on large matrices)
+        target_distance_between_samples = dists.mean().item() / 10
+        number_of_samples = target_number_of_samples + 1
+        random_numbers = torch.rand(len(x), device=device)
 
         while number_of_samples > target_number_of_samples:
-            subsampling_factor = np.sum(dists < target_distance_between_samples,
-                                        axis=-1) + 1  # expected_num_samples = np.sum(1 / subsampling_factor)
+            subsampling_factor = (dists < target_distance_between_samples).sum(dim=-1).float() + 1
             keep_mask = random_numbers < (1 / subsampling_factor)
-            number_of_samples = np.sum(keep_mask)
-            target_distance_between_samples *= 1.1  # Increase the target distance for the next iteration if we still have too many samples
+            number_of_samples = keep_mask.sum().item()
+            target_distance_between_samples *= 1.1
 
-        return keep_mask
+        return keep_mask.cpu().numpy()
 
     # perform subsample iteratively on random subsets of the data to speed up the nearest neighbor search
     keep_mask_total = np.full(len(features), False)
