@@ -56,23 +56,30 @@ class RCMNPipeline:
         self.backbone = DinoV3Backbone(
             backend_cfg['backbone'], self.layers, device
         )
-        self.patch_exec = PatchedExecution(
-            backend_cfg['patch_size'],
-            backend_cfg['patch_overlap'],
-            self.backbone.model_patch_size,
-        )
+        self.base_patch_size = backend_cfg['patch_size']
+        self.base_patch_overlap = backend_cfg['patch_overlap']
+        self.model_patch_size = self.backbone.model_patch_size
         self.base_resize_factor = backend_cfg['patch_size'] / 1024
         self.evaluation_downscale = backend_cfg['evaluation_downscale']
         brightness_aug = tuple(backend_cfg.get('brightness_augmentation', (1.0, 1.0)))
 
         # --- Scales ---
+        # Each scale adjusts both resize_factor AND patch_size proportionally,
+        # so the number of patches per image stays roughly constant.
+        # scale=1.0 → original SuperADD behavior.
+        # scale=0.5 → half resolution, half patch_size (global context).
         self.scales = config['fusion']['scales']
 
-        # Per-scale preprocessing (train = augmented, test = clean)
+        self.patch_execs: dict[float, PatchedExecution] = {}
         self.train_preprocessing: dict[float, PreProcessing] = {}
         self.test_preprocessing: dict[float, PreProcessing] = {}
         for s in self.scales:
             rf = self.base_resize_factor * s
+            ps = max(self.base_patch_size, int(self.base_patch_size * s))
+            # Ensure divisibility by model_patch_size
+            ps = (ps // self.model_patch_size) * self.model_patch_size
+            po = max(self.model_patch_size, (self.base_patch_overlap * s) // self.model_patch_size * self.model_patch_size)
+            self.patch_execs[s] = PatchedExecution(ps, po, self.model_patch_size)
             self.train_preprocessing[s] = PreProcessing(device, rf, brightness_aug)
             self.test_preprocessing[s] = PreProcessing(device, rf, (1.0, 1.0))
 
@@ -148,7 +155,7 @@ class RCMNPipeline:
             x = self.train_preprocessing[scale](x)
         else:
             x = self.test_preprocessing[scale](x)
-        return self.patch_exec(x, self.backbone)
+        return self.patch_execs[scale](x, self.backbone)
 
     # ------------------------------------------------------------------ #
     #  Training
