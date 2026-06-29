@@ -1,0 +1,40 @@
+{
+    "backend": {
+        "backbone": "dinov3_vith16plus",
+        "layers": [7, 15, 23, 31],
+        "patch_size": 640,
+        "patch_overlap": 128,
+        "brightness_augmentation": [0.8, 1.2],
+        "evaluation_downscale": 4
+    },
+    "memory": {
+        "strategy": "knn_dedup",
+        "max_database_size": 100000,
+        "subsampling_iterations": 100
+    },
+    "fusion": {
+        "strategy": "single_scale",
+        "scales": [1.0]
+    },
+    "calibration": {
+        "strategy": "percentile",
+        "threshold_fraction": 8,
+        "threshold_percentile": 95,
+        "threshold_factor": 1.421,
+        "closing_radius": 26,
+        "closing_angles": 16,
+        "closing_lower_threshold": 0.8,
+        "binary_erosion": 1
+    },
+    "data": {
+        "datasets_dir": "./data/",
+        "dino_weights_dir": "./weights/",
+        "models_dir": "./models_rcmn/",
+        "results_dir": "./outputs_rcmn/",
+        "categories": ["can", "fabric", "fruit_jelly", "rice", "sheet_metal", "vial", "wallplugs", "walnuts"],
+        "test_split": ["test_public", "test_private", "test_private_mixed"],
+        "save_predictions": true,
+        "evaluate_good_images": false
+    },
+    "debug": false
+}
