@@ -126,11 +126,22 @@ class PatchedExecution:
 class DinoV3Backbone:
 
     def __init__(self, model_name: str, layers: list[int], device):
-        self.dino = torch.hub.load(
-            'facebookresearch/dinov3',
-            model=model_name,
-            weights=str(get_weights_path(model_name))
-        ).to(device).eval()
+        # Prefer locally cached dinov3 repo to avoid GitHub network access
+        # (required in environments where github.com is unreachable).
+        local_repo = Path(torch.hub.get_dir()) / 'facebookresearch_dinov3_main'
+        if local_repo.exists():
+            self.dino = torch.hub.load(
+                str(local_repo),
+                model=model_name,
+                source='local',
+                weights=str(get_weights_path(model_name))
+            ).to(device).eval()
+        else:
+            self.dino = torch.hub.load(
+                'facebookresearch/dinov3',
+                model=model_name,
+                weights=str(get_weights_path(model_name))
+            ).to(device).eval()
         self.layers = layers
         self.model_patch_size = self.dino.patch_embed.patch_size[0]
 
