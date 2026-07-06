@@ -75,7 +75,7 @@ class RCMNPipeline:
         self.test_preprocessing: dict[float, PreProcessing] = {}
         for s in self.scales:
             rf = self.base_resize_factor * s
-            ps = max(self.base_patch_size, int(self.base_patch_size * s))
+            ps = max(self.model_patch_size, int(self.base_patch_size * s))
             # Ensure divisibility by model_patch_size
             ps = (ps // self.model_patch_size) * self.model_patch_size
             po = max(self.model_patch_size, (self.base_patch_overlap * s) // self.model_patch_size * self.model_patch_size)
@@ -113,7 +113,7 @@ class RCMNPipeline:
         gc.collect()
 
     def _build_fusion_metadata(
-        self, margin_maps: dict
+        self, margin_maps: dict, test_feat_means: dict | None = None
     ) -> dict:
         """Build metadata dict for reliability fusion."""
         metadata = {}
@@ -123,25 +123,36 @@ class RCMNPipeline:
             metadata['normal_dists'] = self.normal_dists
         if self.feat_means:
             metadata['feat_means'] = self.feat_means
+        if test_feat_means:
+            metadata['test_feat_means'] = test_feat_means
         return metadata
 
     def _compute_scale_support(
         self, upsampled_maps: dict
     ) -> np.ndarray | None:
-        """Count how many (scale, layer) maps exceed threshold at each pixel.
+        """Count how many (scale, layer) maps exceed their own percentile threshold.
+
+        Each map uses its own P95 (from normal_dists if available, else from
+        the map itself) as threshold, so scales/layers with different distance
+        distributions are comparable.
 
         Used by NCC component calibration to filter single-scale false positives.
         Returns None when only one scale is used (no filtering benefit).
         """
         if len(self.scales) <= 1:
             return None
-        threshold = self.normal_stats.get('threshold', 0)
-        if threshold == 0:
-            return None
+
         support = None
-        for dists in upsampled_maps.values():
+        for key, dists in upsampled_maps.items():
+            # Use per-map threshold: normal_dists P99 if available, else map P95
+            if key in self.normal_dists:
+                p99, _ = self.normal_dists[key]
+                threshold = p99
+            else:
+                threshold = float(dists.quantile(0.95).item())
             binary = (dists > threshold).int()
             support = binary if support is None else support + binary
+
         return support.cpu().numpy().astype(np.int32) if support is not None else None
 
     def _extract_features(self, image: torch.Tensor, scale: float, train: bool) -> list:
@@ -283,6 +294,7 @@ class RCMNPipeline:
         knn_k = 2 if self._uses_reliability else 1
         raw_maps: dict[tuple[float, int], torch.Tensor] = {}
         margin_maps: dict[tuple[float, int], torch.Tensor] = {}
+        test_feat_means: dict[tuple[float, int], torch.Tensor] = {}
         raw_dists_flat: dict[tuple[float, int], list[float]] | None = (
             {} if return_raw_dists else None
         )
@@ -292,12 +304,12 @@ class RCMNPipeline:
 
             for layer, predicted_embedding in zip(self.layers, prediction):
                 _, h, w, c = predicted_embedding.shape
-                query = torch.as_tensor(predicted_embedding).reshape(h * w, c).to(
+                feat = torch.as_tensor(predicted_embedding).reshape(h * w, c).to(
                     self.device
                 )
                 keys = self.memory_banks[(scale, layer)]
                 dists, _ = nearest_neighbors(
-                    query, keys, knn_neighbors=knn_k, normalize=False
+                    feat, keys, knn_neighbors=knn_k, normalize=False
                 )
                 d1 = dists[:, 0].reshape(h, w) / c
                 raw_maps[(scale, layer)] = d1
@@ -308,6 +320,10 @@ class RCMNPipeline:
 
                 if raw_dists_flat is not None:
                     raw_dists_flat[(scale, layer)] = d1.flatten().cpu().tolist()
+
+                # Compute test feature mean for illumination cue
+                if self._uses_reliability and self.feat_means:
+                    test_feat_means[(scale, layer)] = feat.mean(dim=0)
 
         self._clear_cache()
 
@@ -323,7 +339,19 @@ class RCMNPipeline:
             upsampled_maps[key] = up[0, 0]
 
         # --- Stage 2: fusion ---
-        metadata = self._build_fusion_metadata(margin_maps)
+        # Upsample margin maps to match raw maps
+        upsampled_margins: dict[tuple[float, int], torch.Tensor] = {}
+        for key, margins in margin_maps.items():
+            up = torch.nn.functional.interpolate(
+                margins[None, None].float(),
+                size=output_shape,
+                mode='bilinear',
+                align_corners=False,
+            )
+            upsampled_margins[key] = up[0, 0]
+
+        # Compute test feature means for illumination cue
+        metadata = self._build_fusion_metadata(upsampled_margins, test_feat_means)
         fused = self.fusion_fn(
             upsampled_maps, output_shape, self.config['fusion'], metadata=metadata
         )

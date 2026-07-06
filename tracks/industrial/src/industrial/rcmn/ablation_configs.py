@@ -21,15 +21,18 @@ from .config import load_config, get_root
 
 
 STRATEGY_COMBOS = [
-    # (memory, fusion, calibration, scales, name)
-    ("knn_dedup", "single_scale", "percentile", [1.0], "000_baseline"),
-    ("coverage_aware", "single_scale", "percentile", [1.0], "100_cmc"),
-    ("knn_dedup", "mean_multi", "percentile", [0.5, 1.0], "010_mean_multi"),
-    ("knn_dedup", "single_scale", "component", [1.0], "001_ncc"),
-    ("coverage_aware", "mean_multi", "percentile", [0.5, 1.0], "110_cmc_mean"),
-    ("coverage_aware", "single_scale", "component", [1.0], "101_cmc_ncc"),
-    ("knn_dedup", "mean_multi", "component", [0.5, 1.0], "011_mean_ncc"),
-    ("coverage_aware", "reliability", "component", [0.5, 1.0], "111_full_rcmn"),
+    # (memory, fusion, calibration, scales, name, max_db_size)
+    # Core 2^3 ablation
+    ("knn_dedup", "single_scale", "percentile", [1.0], "000_baseline", 100000),
+    ("coverage_aware", "single_scale", "percentile", [1.0], "100_cmc", 100000),
+    ("knn_dedup", "reliability", "percentile", [0.5, 1.0], "010_rsf", 100000),
+    ("knn_dedup", "single_scale", "component", [1.0], "001_ncc", 100000),
+    ("coverage_aware", "reliability", "percentile", [0.5, 1.0], "110_cmc_rsf", 100000),
+    ("coverage_aware", "single_scale", "component", [1.0], "101_cmc_ncc", 100000),
+    ("knn_dedup", "reliability", "component", [0.5, 1.0], "011_rsf_ncc", 100000),
+    ("coverage_aware", "reliability", "component", [0.5, 1.0], "111_full_rcmn", 100000),
+    # Scale fusion sub-ablation (single scale vs mean vs reliability)
+    ("knn_dedup", "mean_multi", "percentile", [0.5, 1.0], "010_mean_multi", 100000),
 ]
 
 
@@ -42,9 +45,10 @@ def generate_configs(output_dir: str | Path | None = None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for memory, fusion, calibration, scales, name in STRATEGY_COMBOS:
+    for memory, fusion, calibration, scales, name, max_db in STRATEGY_COMBOS:
         config = json.loads(json.dumps(base_config))  # deep copy
         config['memory']['strategy'] = memory
+        config['memory']['max_database_size'] = max_db
         config['fusion']['strategy'] = fusion
         config['fusion']['scales'] = scales
         config['calibration']['strategy'] = calibration
